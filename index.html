@@ -2742,3 +2742,234 @@
   </script>
 </body>
 </html>
+<!-- =====================================================================
+  NagaConnect — OTP LOGIN MODULE (drop-in)
+  HOW TO USE:
+  1. Paste this whole block just before </body> in your NagaConnect page.
+  2. In triggerBookNowEntry(type), when type === 'old', call: openOtpLogin();
+     (or add onclick="openOtpLogin()" to any "Log In" button)
+  3. On success it saves a session and calls your switchTab('dashboard').
+  NOTE: This is a DEMO OTP (generated in the browser and shown on screen).
+  For production, replace sendOtpToServer() / verifyOtpOnServer() with calls
+  to your backend + an SMS/email provider (MSG91, Twilio, etc.).
+====================================================================== -->
+
+<div id="otpModal" class="hidden fixed inset-0 z-[100] bg-slate-900/60 flex items-center justify-center p-4">
+  <div class="bg-white w-full max-w-md rounded-3xl border-2 border-nagaYellow shadow-2xl overflow-hidden">
+    <div class="naga-bright-border"></div>
+    <div class="p-6 space-y-5">
+      <div class="flex items-start justify-between">
+        <div>
+          <span class="text-[11px] font-extrabold uppercase px-2.5 py-0.5 rounded-full bg-green-100 text-nagaGreen">Returning User • Secure Login</span>
+          <h3 class="text-xl font-extrabold text-slate-900 mt-1">Log in with OTP</h3>
+          <p class="text-xs text-slate-600" id="otpSubtitle">Enter your registered mobile number or email to get a 6-digit code.</p>
+        </div>
+        <button onclick="closeOtpLogin()" class="text-slate-400 hover:text-nagaRed text-xl font-extrabold" aria-label="Close">✕</button>
+      </div>
+
+      <!-- STEP 1: identifier -->
+      <form id="otpStepRequest" onsubmit="handleOtpRequest(event)" class="space-y-3">
+        <label class="block text-xs font-extrabold text-slate-700">Mobile Number or Email *</label>
+        <input id="otpIdentifier" type="text" required autocomplete="username"
+               placeholder="+91 87947 95051 or you@email.com"
+               class="w-full px-3.5 py-2.5 rounded-xl bg-amber-50/40 border-2 border-slate-200 text-sm font-medium focus:outline-none focus:border-nagaRed" />
+        <p id="otpRequestError" class="hidden text-xs font-bold text-nagaRed"></p>
+        <button type="submit" class="w-full bg-nagaRed hover:bg-nagaRedLight text-white font-extrabold py-2.5 rounded-xl shadow-md transition text-sm">
+          Send OTP →
+        </button>
+      </form>
+
+      <!-- STEP 2: verify -->
+      <form id="otpStepVerify" onsubmit="handleOtpVerify(event)" class="hidden space-y-4">
+        <div class="flex justify-between gap-2" id="otpBoxes">
+          <input inputmode="numeric" maxlength="1" class="otp-box w-full aspect-square max-w-[52px] text-center text-xl font-extrabold rounded-xl border-2 border-slate-300 focus:border-nagaGreen focus:outline-none" />
+          <input inputmode="numeric" maxlength="1" class="otp-box w-full aspect-square max-w-[52px] text-center text-xl font-extrabold rounded-xl border-2 border-slate-300 focus:border-nagaGreen focus:outline-none" />
+          <input inputmode="numeric" maxlength="1" class="otp-box w-full aspect-square max-w-[52px] text-center text-xl font-extrabold rounded-xl border-2 border-slate-300 focus:border-nagaGreen focus:outline-none" />
+          <input inputmode="numeric" maxlength="1" class="otp-box w-full aspect-square max-w-[52px] text-center text-xl font-extrabold rounded-xl border-2 border-slate-300 focus:border-nagaGreen focus:outline-none" />
+          <input inputmode="numeric" maxlength="1" class="otp-box w-full aspect-square max-w-[52px] text-center text-xl font-extrabold rounded-xl border-2 border-slate-300 focus:border-nagaGreen focus:outline-none" />
+          <input inputmode="numeric" maxlength="1" class="otp-box w-full aspect-square max-w-[52px] text-center text-xl font-extrabold rounded-xl border-2 border-slate-300 focus:border-nagaGreen focus:outline-none" />
+        </div>
+        <p id="otpVerifyError" class="hidden text-xs font-bold text-nagaRed"></p>
+        <div class="flex items-center justify-between text-xs">
+          <span class="text-slate-600">Code expires in <strong id="otpExpiry" class="text-nagaRed">05:00</strong></span>
+          <button type="button" id="otpResendBtn" onclick="resendOtp()" disabled
+                  class="font-extrabold text-nagaRed disabled:text-slate-400 disabled:cursor-not-allowed hover:underline">
+            Resend OTP
+          </button>
+        </div>
+        <button type="submit" class="w-full bg-nagaGreen hover:bg-green-700 text-white font-extrabold py-2.5 rounded-xl shadow-md transition text-sm">
+          Verify & Log In ✓
+        </button>
+        <button type="button" onclick="otpBackToRequest()" class="w-full text-xs font-bold text-slate-500 hover:text-nagaRed">
+          ← Use a different number / email
+        </button>
+      </form>
+
+      <!-- Demo-only OTP display (remove in production) -->
+      <div id="otpDemoBox" class="hidden p-3 rounded-xl bg-amber-50 border-2 border-nagaYellow text-xs text-slate-700">
+        📲 <strong>Demo mode:</strong> your OTP is <span id="otpDemoCode" class="font-extrabold text-nagaRed tracking-widest"></span>
+        <span class="block text-[10px] text-slate-500">In production this is sent by SMS/email and never shown on screen.</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var OTP_TTL_SEC = 300;      // code valid 5 minutes
+  var RESEND_WAIT_SEC = 30;   // resend cooldown
+  var MAX_ATTEMPTS = 3;       // wrong tries before code is invalidated
+
+  var state = { identifier: '', code: null, expiresAt: 0, attempts: 0, expiryTimer: null, resendTimer: null };
+
+  function $(id) { return document.getElementById(id); }
+  function boxes() { return Array.prototype.slice.call(document.querySelectorAll('#otpBoxes .otp-box')); }
+
+  // ---- validation -------------------------------------------------------
+  function normalizeIdentifier(v) {
+    v = v.trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return { type: 'email', value: v.toLowerCase() };
+    var digits = v.replace(/[\s\-()]/g, '').replace(/^\+?91/, '');
+    if (/^[6-9]\d{9}$/.test(digits)) return { type: 'mobile', value: '+91' + digits };
+    return null;
+  }
+  function mask(id) {
+    if (id.type === 'email') {
+      var p = id.value.split('@');
+      return p[0].slice(0, 2) + '•••@' + p[1];
+    }
+    return id.value.slice(0, 3) + '•••••' + id.value.slice(-3);
+  }
+
+  // ---- "server" stubs (replace with real API calls) ----------------------
+  function sendOtpToServer(id) {
+    // Production: POST /api/auth/otp/send { identifier } → SMS/email provider
+    state.code = String(Math.floor(100000 + Math.random() * 900000));
+    state.expiresAt = Date.now() + OTP_TTL_SEC * 1000;
+    state.attempts = 0;
+    $('otpDemoCode').textContent = state.code;   // DEMO ONLY
+    $('otpDemoBox').classList.remove('hidden');  // DEMO ONLY
+  }
+  function verifyOtpOnServer(entered) {
+    // Production: POST /api/auth/otp/verify { identifier, code } → returns session token
+    if (Date.now() > state.expiresAt) return 'expired';
+    if (state.attempts >= MAX_ATTEMPTS) return 'locked';
+    if (entered === state.code) return 'ok';
+    state.attempts++;
+    return state.attempts >= MAX_ATTEMPTS ? 'locked' : 'wrong';
+  }
+
+  // ---- timers -----------------------------------------------------------
+  function fmt(s) { var m = Math.floor(s / 60), r = s % 60; return (m < 10 ? '0' : '') + m + ':' + (r < 10 ? '0' : '') + r; }
+  function startTimers() {
+    clearInterval(state.expiryTimer); clearInterval(state.resendTimer);
+    var resendLeft = RESEND_WAIT_SEC, btn = $('otpResendBtn');
+    btn.disabled = true; btn.textContent = 'Resend in ' + resendLeft + 's';
+    state.resendTimer = setInterval(function () {
+      resendLeft--;
+      if (resendLeft <= 0) { clearInterval(state.resendTimer); btn.disabled = false; btn.textContent = 'Resend OTP'; }
+      else btn.textContent = 'Resend in ' + resendLeft + 's';
+    }, 1000);
+    state.expiryTimer = setInterval(function () {
+      var left = Math.max(0, Math.round((state.expiresAt - Date.now()) / 1000));
+      $('otpExpiry').textContent = fmt(left);
+      if (left <= 0) { clearInterval(state.expiryTimer); showVerifyError('Code expired. Please request a new OTP.'); }
+    }, 500);
+  }
+
+  // ---- UI helpers -------------------------------------------------------
+  function showErr(el, msg) { el.textContent = msg; el.classList.remove('hidden'); }
+  function showVerifyError(msg) { showErr($('otpVerifyError'), msg); }
+  function clearBoxes() { boxes().forEach(function (b) { b.value = ''; }); boxes()[0].focus(); }
+
+  // ---- public API -------------------------------------------------------
+  window.openOtpLogin = function () {
+    $('otpModal').classList.remove('hidden');
+    otpBackToRequest();
+    setTimeout(function () { $('otpIdentifier').focus(); }, 50);
+  };
+  window.closeOtpLogin = function () {
+    $('otpModal').classList.add('hidden');
+    clearInterval(state.expiryTimer); clearInterval(state.resendTimer);
+    state.code = null;
+  };
+  window.otpBackToRequest = function () {
+    clearInterval(state.expiryTimer); clearInterval(state.resendTimer);
+    $('otpStepVerify').classList.add('hidden');
+    $('otpStepRequest').classList.remove('hidden');
+    $('otpDemoBox').classList.add('hidden');
+    $('otpRequestError').classList.add('hidden');
+    $('otpVerifyError').classList.add('hidden');
+    $('otpSubtitle').textContent = 'Enter your registered mobile number or email to get a 6-digit code.';
+  };
+
+  window.handleOtpRequest = function (e) {
+    e.preventDefault();
+    var id = normalizeIdentifier($('otpIdentifier').value);
+    if (!id) return showErr($('otpRequestError'), 'Enter a valid 10-digit Indian mobile number or email address.');
+    $('otpRequestError').classList.add('hidden');
+    state.identifier = id.value;
+    sendOtpToServer(id);
+    $('otpStepRequest').classList.add('hidden');
+    $('otpStepVerify').classList.remove('hidden');
+    $('otpVerifyError').classList.add('hidden');
+    $('otpSubtitle').textContent = 'We sent a 6-digit code to ' + mask(id) + '.';
+    clearBoxes();
+    startTimers();
+  };
+
+  window.resendOtp = function () {
+    var id = normalizeIdentifier(state.identifier);
+    if (!id) return;
+    sendOtpToServer(id);
+    $('otpVerifyError').classList.add('hidden');
+    clearBoxes();
+    startTimers();
+  };
+
+  window.handleOtpVerify = function (e) {
+    e.preventDefault();
+    var entered = boxes().map(function (b) { return b.value; }).join('');
+    if (entered.length !== 6) return showVerifyError('Please enter all 6 digits.');
+    var result = verifyOtpOnServer(entered);
+    if (result === 'ok') {
+      try {
+        localStorage.setItem('nagaconnect_session', JSON.stringify({ id: state.identifier, loggedInAt: Date.now(), method: 'otp' }));
+      } catch (err) {}
+      closeOtpLogin();
+      if (typeof window.onOtpLoginSuccess === 'function') window.onOtpLoginSuccess(state.identifier);
+      else if (typeof window.switchTab === 'function') window.switchTab('dashboard');
+    } else if (result === 'expired') {
+      showVerifyError('Code expired. Please request a new OTP.');
+    } else if (result === 'locked') {
+      showVerifyError('Too many wrong attempts. Please request a new OTP.');
+      state.code = null; clearBoxes();
+    } else {
+      showVerifyError('Incorrect code. Attempts left: ' + (MAX_ATTEMPTS - state.attempts));
+      clearBoxes();
+    }
+  };
+
+  // ---- OTP box behaviour: auto-advance, backspace, paste ----------------
+  document.addEventListener('input', function (e) {
+    if (!e.target.classList || !e.target.classList.contains('otp-box')) return;
+    e.target.value = e.target.value.replace(/\D/g, '').slice(0, 1);
+    var b = boxes(), i = b.indexOf(e.target);
+    if (e.target.value && i < b.length - 1) b[i + 1].focus();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (!e.target.classList || !e.target.classList.contains('otp-box')) return;
+    var b = boxes(), i = b.indexOf(e.target);
+    if (e.key === 'Backspace' && !e.target.value && i > 0) b[i - 1].focus();
+    if (e.key === 'ArrowLeft' && i > 0) b[i - 1].focus();
+    if (e.key === 'ArrowRight' && i < b.length - 1) b[i + 1].focus();
+  });
+  document.addEventListener('paste', function (e) {
+    if (!e.target.classList || !e.target.classList.contains('otp-box')) return;
+    e.preventDefault();
+    var text = (e.clipboardData || window.clipboardData).getData('text').replace(/\D/g, '').slice(0, 6);
+    boxes().forEach(function (b, i) { b.value = text[i] || ''; });
+    var next = boxes()[Math.min(text.length, 5)]; if (next) next.focus();
+  });
+})();
+</script>
